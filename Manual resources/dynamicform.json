@@ -1,0 +1,189 @@
+[
+  {
+    "label": "Select user account",
+    "fields": [
+      {
+        "key": "searchfield",
+        "templateOptions": {
+          "label": "Search",
+          "placeholder": "Username or email address"
+        },
+        "type": "input",
+        "summaryVisibility": "Hide element",
+        "requiresTemplateOptions": true,
+        "requiresKey": true,
+        "requiresDataSource": false
+      },
+      {
+        "key": "gridUsers",
+        "templateOptions": {
+          "label": "Select user",
+          "required": true,
+          "grid": {
+            "columns": [
+              {
+                "headerName": "Display Name",
+                "field": "DisplayName"
+              },
+              {
+                "headerName": "User Principal Name",
+                "field": "UserPrincipalName"
+              },
+              {
+                "headerName": "Enabled",
+                "field": "Enabled"
+              },
+              {
+                "headerName": "Department",
+                "field": "Department"
+              },
+              {
+                "headerName": "Title",
+                "field": "Title"
+              },
+              {
+                "headerName": "Id",
+                "field": "Id"
+              }
+            ],
+            "height": 300,
+            "rowSelection": "single"
+          },
+          "dataSourceConfig": {
+            "dataSourceGuid": "$dataSourceGuid_0",
+            "input": {
+              "propertyInputs": [
+                {
+                  "propertyName": "searchUser",
+                  "otherFieldValue": {
+                    "otherFieldKey": "searchfield"
+                  }
+                }
+              ]
+            }
+          },
+          "useFilter": false,
+          "allowCsvDownload": true
+        },
+        "type": "grid",
+        "summaryVisibility": "Show",
+        "requiresTemplateOptions": true,
+        "requiresKey": true,
+        "requiresDataSource": true
+      }
+    ]
+  },
+  {
+    "label": "Intune",
+    "fields": [
+      {
+        "key": "gridDetails",
+        "templateOptions": {
+          "label": "Basic attributes",
+          "required": false,
+          "grid": {
+            "columns": [
+              {
+                "headerName": "Name",
+                "field": "name"
+              },
+              {
+                "headerName": "Value",
+                "field": "value"
+              }
+            ],
+            "height": 350,
+            "rowSelection": "single"
+          },
+          "dataSourceConfig": {
+            "dataSourceGuid": "$dataSourceGuid_1",
+            "input": {
+              "propertyInputs": [
+                {
+                  "propertyName": "selectedUser",
+                  "otherFieldValue": {
+                    "otherFieldKey": "gridUsers"
+                  }
+                }
+              ]
+            }
+          },
+          "useFilter": false,
+          "allowCsvDownload": true
+        },
+        "type": "grid",
+        "summaryVisibility": "Hide element",
+        "requiresTemplateOptions": true,
+        "requiresKey": true,
+        "requiresDataSource": true
+      },
+      {
+        "templateOptions": {
+          "title": "Select the devices that have to be removed",
+          "titleField": "",
+          "bannerType": "Info",
+          "useBody": false
+        },
+        "type": "textbanner",
+        "summaryVisibility": "Hide element",
+        "body": "Text Banner Content",
+        "requiresTemplateOptions": false,
+        "requiresKey": false,
+        "requiresDataSource": false
+      },
+      {
+        "key": "devices",
+        "templateOptions": {
+          "label": "Devices",
+          "required": false,
+          "filterable": true,
+          "useDataSource": true,
+          "dualList": {
+            "options": [
+              {
+                "guid": "75ea2890-88f8-4851-b202-626123054e14",
+                "name": "Apple"
+              },
+              {
+                "guid": "0607270d-83e2-4574-9894-0b70011b663f",
+                "name": "Pear"
+              },
+              {
+                "guid": "1ef6fe01-3095-4614-a6db-7c8cd416ae3b",
+                "name": "Orange"
+              }
+            ],
+            "optionKeyProperty": "id",
+            "optionDisplayProperty": "name"
+          },
+          "dataSourceConfig": {
+            "dataSourceGuid": "$dataSourceGuid_2",
+            "input": {
+              "propertyInputs": [
+                {
+                  "propertyName": "selectedUser",
+                  "otherFieldValue": {
+                    "otherFieldKey": "gridUsers"
+                  }
+                }
+              ]
+            }
+          },
+          "destinationDataSourceConfig": {
+            "dataSourceGuid": "$dataSourceGuid_3",
+            "input": {
+              "propertyInputs": []
+            }
+          }
+        },
+        "type": "duallist",
+        "summaryVisibility": "Show",
+        "sourceDataSourceIdentifierSuffix": "source-datasource",
+        "destinationDataSourceIdentifierSuffix": "destination-datasource",
+        "requiresTemplateOptions": true,
+        "requiresKey": true,
+        "requiresDataSource": false
+      }
+    ]
+  }
+]
