@@ -1,0 +1,886 @@
+# Set TLS to accept TLS, TLS 1.1 and TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
+
+#HelloID variables
+#Note: when running this script inside HelloID; portalUrl and API credentials are provided automatically (generate and save API credentials first in your admin panel!)
+$portalUrl = "https://CUSTOMER.helloid.com"
+$apiKey = "API_KEY"
+$apiSecret = "API_SECRET"
+$delegatedFormAccessGroupNames = @("") #Only unique names are supported. Groups must exist!
+$delegatedFormCategories = @("Entra ID","User Management") #Only unique names are supported. Categories will be created if not exists
+$script:debugLogging = $false #Default value: $false. If $true, the HelloID resource GUIDs will be shown in the logging
+$script:duplicateForm = $false #Default value: $false. If $true, the HelloID resource names will be changed to import a duplicate Form
+$script:duplicateFormSuffix = "_tmp" #the suffix will be added to all HelloID resource names to generate a duplicate form with different resource names
+
+#The following HelloID Global variables are used by this form. No existing HelloID global variables will be overriden only new ones are created.
+#NOTE: You can also update the HelloID Global variable values afterwards in the HelloID Admin Portal: https://<CUSTOMER>.helloid.com/admin/variablelibrary
+$globalHelloIDVariables = [System.Collections.Generic.List[object]]@();
+
+#Global variable #1 >> EntraIdCertificateBase64String
+$tmpName = @'
+EntraIdCertificateBase64String
+'@ 
+$tmpValue = @'
+'@ 
+$globalHelloIDVariables.Add([PSCustomObject]@{name = $tmpName; value = $tmpValue; secret = "False"});
+
+#Global variable #2 >> EntraIdCertificatePassword
+$tmpName = @'
+EntraIdCertificatePassword
+'@ 
+$tmpValue = "" 
+$globalHelloIDVariables.Add([PSCustomObject]@{name = $tmpName; value = $tmpValue; secret = "False"});
+
+#Global variable #3 >> EntraIdAppId
+$tmpName = @'
+EntraIdAppId
+'@ 
+$tmpValue = "" 
+$globalHelloIDVariables.Add([PSCustomObject]@{name = $tmpName; value = $tmpValue; secret = "False"});
+
+#Global variable #4 >> EntraIdTenantId
+$tmpName = @'
+EntraIdTenantId
+'@ 
+$tmpValue = "" 
+$globalHelloIDVariables.Add([PSCustomObject]@{name = $tmpName; value = $tmpValue; secret = "False"});
+
+#Global variable #5 >> companyName
+$tmpName = @'
+companyName
+'@ 
+$tmpValue = @'
+{{company.name}}
+'@ 
+$globalHelloIDVariables.Add([PSCustomObject]@{name = $tmpName; value = $tmpValue; secret = "False"});
+
+
+#make sure write-information logging is visual
+$InformationPreference = "continue"
+
+# Check for prefilled API Authorization header
+if (-not [string]::IsNullOrEmpty($portalApiBasic)) {
+    $script:headers = @{"authorization" = $portalApiBasic}
+    Write-Information "Using prefilled API credentials"
+} else {
+    # Create authorization headers with HelloID API key
+    $pair = "$apiKey" + ":" + "$apiSecret"
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    $base64 = [System.Convert]::ToBase64String($bytes)
+    $key = "Basic $base64"
+    $script:headers = @{"authorization" = $Key}
+    Write-Information "Using manual API credentials"
+}
+
+# Check for prefilled PortalBaseURL
+if (-not [string]::IsNullOrEmpty($portalBaseUrl)) {
+    $script:PortalBaseUrl = $portalBaseUrl
+    Write-Information "Using prefilled PortalURL: $script:PortalBaseUrl"
+} else {
+    $script:PortalBaseUrl = $portalUrl
+    Write-Information "Using manual PortalURL: $script:PortalBaseUrl"
+}
+
+# Define specific endpoint URI
+$script:PortalBaseUrl = $script:PortalBaseUrl.trim("/") + "/"  
+
+# Make sure to reveive an empty array using PowerShell Core
+function ConvertFrom-Json-WithEmptyArray([string]$jsonString) {
+    # Running in PowerShell Core?
+    if($IsCoreCLR -eq $true){
+        $r = [Object[]]($jsonString | ConvertFrom-Json -NoEnumerate)
+        return ,$r  # Force return value to be an array using a comma
+    } else {
+        $r = [Object[]]($jsonString | ConvertFrom-Json)
+        return ,$r  # Force return value to be an array using a comma
+    }
+}
+
+function Invoke-HelloIDGlobalVariable {
+    param(
+        [parameter(Mandatory)][String]$Name,
+        [parameter(Mandatory)][String][AllowEmptyString()]$Value,
+        [parameter(Mandatory)][String]$Secret
+    )
+
+    $Name = $Name + $(if ($script:duplicateForm -eq $true) { $script:duplicateFormSuffix })
+
+    try {
+        $uri = ($script:PortalBaseUrl + "api/v1/automation/variables/named/$Name")
+        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false
+
+        if ([string]::IsNullOrEmpty($response.automationVariableGuid)) {
+            #Create Variable
+            $body = @{
+                name     = $Name;
+                value    = $Value;
+                secret   = $Secret;
+                ItemType = 0;
+            }    
+            $body = ConvertTo-Json -InputObject $body -Depth 100
+
+            $uri = ($script:PortalBaseUrl + "api/v1/automation/variable")
+            $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false -Body $body
+            $variableGuid = $response.automationVariableGuid
+
+            Write-Information "Variable '$Name' created$(if ($script:debugLogging -eq $true) { ": " + $variableGuid })"
+        } else {
+            $variableGuid = $response.automationVariableGuid
+            Write-Warning "Variable '$Name' already exists$(if ($script:debugLogging -eq $true) { ": " + $variableGuid })"
+        }
+    } catch {
+        Write-Error "Variable '$Name', message: $_"
+    }
+}
+
+function Invoke-HelloIDAutomationTask {
+    param(
+        [parameter(Mandatory)][String]$TaskName,
+        [parameter(Mandatory)][String]$UseTemplate,
+        [parameter(Mandatory)][String]$AutomationContainer,
+        [parameter(Mandatory)][String][AllowEmptyString()]$Variables,
+        [parameter(Mandatory)][String]$PowershellScript,
+        [parameter()][String][AllowEmptyString()]$ObjectGuid,
+        [parameter()][String][AllowEmptyString()]$ForceCreateTask,
+        [parameter(Mandatory)][Ref]$returnObject
+    )
+
+    $TaskName = $TaskName + $(if ($script:duplicateForm -eq $true) { $script:duplicateFormSuffix })
+
+    try {
+        $uri = ($script:PortalBaseUrl +"api/v1/automationtasks?search=$TaskName&container=$AutomationContainer")
+        $responseRaw = (Invoke-RestMethod -Method Get -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false) 
+        $response = $responseRaw | Where-Object -filter {$_.name -eq $TaskName}
+
+        if([string]::IsNullOrEmpty($response.automationTaskGuid) -or $ForceCreateTask -eq $true) {
+            #Create Task
+
+            $body = @{
+                name                = $TaskName;
+                useTemplate         = $UseTemplate;
+                powerShellScript    = $PowershellScript;
+                automationContainer = $AutomationContainer;
+                objectGuid          = $ObjectGuid;
+                variables           = (ConvertFrom-Json-WithEmptyArray($Variables));
+            }
+            $body = ConvertTo-Json -InputObject $body -Depth 100
+
+            $uri = ($script:PortalBaseUrl +"api/v1/automationtasks/powershell")
+            $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false -Body $body
+            $taskGuid = $response.automationTaskGuid
+
+            Write-Information "Powershell task '$TaskName' created$(if ($script:debugLogging -eq $true) { ": " + $taskGuid })"
+        } else {
+            #Get TaskGUID
+            $taskGuid = $response.automationTaskGuid
+            Write-Warning "Powershell task '$TaskName' already exists$(if ($script:debugLogging -eq $true) { ": " + $taskGuid })"
+        }
+    } catch {
+        Write-Error "Powershell task '$TaskName', message: $_"
+    }
+
+    $returnObject.Value = $taskGuid
+}
+
+function Invoke-HelloIDDatasource {
+    param(
+        [parameter(Mandatory)][String]$DatasourceName,
+        [parameter(Mandatory)][String]$DatasourceType,
+        [parameter(Mandatory)][String][AllowEmptyString()]$DatasourceModel,
+        [parameter()][String][AllowEmptyString()]$DatasourceStaticValue,
+        [parameter()][String][AllowEmptyString()]$DatasourcePsScript,        
+        [parameter()][String][AllowEmptyString()]$DatasourceInput,
+        [parameter()][String][AllowEmptyString()]$AutomationTaskGuid,
+        [parameter()][String][AllowEmptyString()]$DatasourceRunInCloud,
+        [parameter(Mandatory)][Ref]$returnObject
+    )
+
+    $DatasourceName = $DatasourceName + $(if ($script:duplicateForm -eq $true) { $script:duplicateFormSuffix })
+
+    $datasourceTypeName = switch($DatasourceType) { 
+        "1" { "Native data source"; break} 
+        "2" { "Static data source"; break} 
+        "3" { "Task data source"; break} 
+        "4" { "Powershell data source"; break}
+    }
+
+    try {
+        $uri = ($script:PortalBaseUrl +"api/v1/datasource/named/$DatasourceName")
+        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false
+    
+        if([string]::IsNullOrEmpty($response.dataSourceGUID)) {
+            #Create DataSource
+            $body = @{
+                name               = $DatasourceName;
+                type               = $DatasourceType;
+                model              = (ConvertFrom-Json-WithEmptyArray($DatasourceModel));
+                automationTaskGUID = $AutomationTaskGuid;
+                value              = (ConvertFrom-Json-WithEmptyArray($DatasourceStaticValue));
+                script             = $DatasourcePsScript;
+                input              = (ConvertFrom-Json-WithEmptyArray($DatasourceInput));
+                runInCloud         = $DatasourceRunInCloud;
+            }
+            $body = ConvertTo-Json -InputObject $body -Depth 100
+    
+            $uri = ($script:PortalBaseUrl +"api/v1/datasource")
+            $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false -Body $body
+            
+            $datasourceGuid = $response.dataSourceGUID
+            Write-Information "$datasourceTypeName '$DatasourceName' created$(if ($script:debugLogging -eq $true) { ": " + $datasourceGuid })"
+        } else {
+            #Get DatasourceGUID
+            $datasourceGuid = $response.dataSourceGUID
+            Write-Warning "$datasourceTypeName '$DatasourceName' already exists$(if ($script:debugLogging -eq $true) { ": " + $datasourceGuid })"
+        }
+    } catch {
+        Write-Error "$datasourceTypeName '$DatasourceName', message: $_"
+    }
+
+    $returnObject.Value = $datasourceGuid
+}
+
+function Invoke-HelloIDDynamicForm {
+    param(
+        [parameter(Mandatory)][String]$FormName,
+        [parameter(Mandatory)][String]$FormSchema,
+        [parameter(Mandatory)][Ref]$returnObject
+    )
+
+    $FormName = $FormName + $(if ($script:duplicateForm -eq $true) { $script:duplicateFormSuffix })
+
+    try {
+        try {
+            $uri = ($script:PortalBaseUrl +"api/v1/forms/$FormName")
+            $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false
+        } catch {
+            $response = $null
+        }
+
+        if(([string]::IsNullOrEmpty($response.dynamicFormGUID)) -or ($response.isUpdated -eq $true)) {
+            #Create Dynamic form
+            $body = @{
+                Name       = $FormName;
+                FormSchema = (ConvertFrom-Json-WithEmptyArray($FormSchema));
+            }
+            $body = ConvertTo-Json -InputObject $body -Depth 100
+
+            $uri = ($script:PortalBaseUrl +"api/v1/forms")
+            $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false -Body $body
+
+            $formGuid = $response.dynamicFormGUID
+            Write-Information "Dynamic form '$formName' created$(if ($script:debugLogging -eq $true) { ": " + $formGuid })"
+        } else {
+            $formGuid = $response.dynamicFormGUID
+            Write-Warning "Dynamic form '$FormName' already exists$(if ($script:debugLogging -eq $true) { ": " + $formGuid })"
+        }
+    } catch {
+        Write-Error "Dynamic form '$FormName', message: $_"
+    }
+
+    $returnObject.Value = $formGuid
+}
+
+
+function Invoke-HelloIDDelegatedForm {
+    param(
+        [parameter(Mandatory)][String]$DelegatedFormName,
+        [parameter(Mandatory)][String]$DynamicFormGuid,
+        [parameter()][Array][AllowEmptyString()]$AccessGroups,
+        [parameter()][String][AllowEmptyString()]$Categories,
+        [parameter(Mandatory)][String]$UseFaIcon,
+        [parameter()][String][AllowEmptyString()]$FaIcon,
+        [parameter()][String][AllowEmptyString()]$task,
+        [parameter(Mandatory)][Ref]$returnObject
+    )
+    $delegatedFormCreated = $false
+    $DelegatedFormName = $DelegatedFormName + $(if ($script:duplicateForm -eq $true) { $script:duplicateFormSuffix })
+
+    try {
+        try {
+            $uri = ($script:PortalBaseUrl +"api/v1/delegatedforms/$DelegatedFormName")
+            $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false
+        } catch {
+            $response = $null
+        }
+
+        if([string]::IsNullOrEmpty($response.delegatedFormGUID)) {
+            #Create DelegatedForm
+            $body = @{
+                name            = $DelegatedFormName;
+                dynamicFormGUID = $DynamicFormGuid;
+                isEnabled       = "True";
+                useFaIcon       = $UseFaIcon;
+                faIcon          = $FaIcon;
+                task            = ConvertFrom-Json -inputObject $task;
+            }
+            if(-not[String]::IsNullOrEmpty($AccessGroups)) { 
+                $body += @{
+                    accessGroups    = (ConvertFrom-Json-WithEmptyArray($AccessGroups));
+                }
+            }
+            $body = ConvertTo-Json -InputObject $body -Depth 100
+
+            $uri = ($script:PortalBaseUrl +"api/v1/delegatedforms")
+            $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false -Body $body
+
+            $delegatedFormGuid = $response.delegatedFormGUID
+            Write-Information "Delegated form '$DelegatedFormName' created$(if ($script:debugLogging -eq $true) { ": " + $delegatedFormGuid })"
+            $delegatedFormCreated = $true
+
+            $bodyCategories = $Categories
+            $uri = ($script:PortalBaseUrl +"api/v1/delegatedforms/$delegatedFormGuid/categories")
+            $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false -Body $bodyCategories
+            Write-Information "Delegated form '$DelegatedFormName' updated with categories"
+        } else {
+            #Get delegatedFormGUID
+            $delegatedFormGuid = $response.delegatedFormGUID
+            Write-Warning "Delegated form '$DelegatedFormName' already exists$(if ($script:debugLogging -eq $true) { ": " + $delegatedFormGuid })"
+        }
+    } catch {
+        Write-Error "Delegated form '$DelegatedFormName', message: $_"
+    }
+
+    $returnObject.value.guid = $delegatedFormGuid
+    $returnObject.value.created = $delegatedFormCreated
+}
+
+<# Begin: HelloID Global Variables #>
+foreach ($item in $globalHelloIDVariables) {
+	Invoke-HelloIDGlobalVariable -Name $item.name -Value $item.value -Secret $item.secret 
+}
+<# End: HelloID Global Variables #>
+
+
+<# Begin: HelloID Data sources #>
+<# Begin: DataSource "Entra-ID-remove-intune-device | generate-table-attributes-basic" #>
+$tmpPsScript = @'
+# Set TLS to accept TLS, TLS 1.1 and TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
+
+function Get-MSEntraAccessToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Certificate
+    )
+    try {
+        # Get the DER encoded bytes of the certificate
+        $derBytes = $Certificate.RawData
+
+        # Compute the SHA-256 hash of the DER encoded bytes
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $hashBytes = $sha256.ComputeHash($derBytes)
+        $base64Thumbprint = [System.Convert]::ToBase64String($hashBytes).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Create a JWT (JSON Web Token) header
+        $header = @{
+            'alg'      = 'RS256'
+            'typ'      = 'JWT'
+            'x5t#S256' = $base64Thumbprint
+        } | ConvertTo-Json
+        $base64Header = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header))
+
+        # Calculate the Unix timestamp (seconds since 1970-01-01T00:00:00Z) for 'exp', 'nbf' and 'iat'
+        $currentUnixTimestamp = [math]::Round(((Get-Date).ToUniversalTime() - ([datetime]'1970-01-01T00:00:00Z').ToUniversalTime()).TotalSeconds)
+
+        # Create a JWT payload
+        $payload = [Ordered]@{
+            'iss' = "$entraidappid"
+            'sub' = "$entraidappid"
+            'aud' = "https://login.microsoftonline.com/$EntraIdTenantId/oauth2/token"
+            'exp' = ($currentUnixTimestamp + 3600) # Expires in 1 hour
+            'nbf' = ($currentUnixTimestamp - 300) # Not before 5 minutes ago
+            'iat' = $currentUnixTimestamp
+            'jti' = [Guid]::NewGuid().ToString()
+        } | ConvertTo-Json
+        $base64Payload = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Extract the private key from the certificate
+        $rsaPrivate = $Certificate.PrivateKey
+        $rsa = [System.Security.Cryptography.RSACryptoServiceProvider]::new()
+        $rsa.ImportParameters($rsaPrivate.ExportParameters($true))
+
+        # Sign the JWT
+        $signatureInput = "$base64Header.$base64Payload"
+        $signature = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($signatureInput), 'SHA256')
+        $base64Signature = [System.Convert]::ToBase64String($signature).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Create the JWT token
+        $jwtToken = "$($base64Header).$($base64Payload).$($base64Signature)"
+
+        $createEntraAccessTokenBody = @{
+            grant_type            = 'client_credentials'
+            client_id             = $entraidappid
+            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            client_assertion      = $jwtToken
+            resource              = 'https://graph.microsoft.com'
+        }
+
+        $createEntraAccessTokenSplatParams = @{
+            Uri         = "https://login.microsoftonline.com/$EntraIdTenantId/oauth2/token"
+            Body        = $createEntraAccessTokenBody
+            Method      = 'POST'
+            ContentType = 'application/x-www-form-urlencoded'
+            Verbose     = $false
+            ErrorAction = 'Stop'
+        }
+
+        $createEntraAccessTokenResponse = Invoke-RestMethod @createEntraAccessTokenSplatParams
+        Write-Output $createEntraAccessTokenResponse.access_token
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
+
+function Get-MSEntraCertificate {
+    [CmdletBinding()]
+    param()
+    try {
+        $rawCertificate = [system.convert]::FromBase64String($EntraIdCertificateBase64String)
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate, $EntraIdCertificatePassword, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        Write-Output $certificate
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
+
+try {
+    $id = $datasource.selectedUser.Id
+
+    Write-Verbose "Generating Microsoft Graph API Access Token.."
+
+    # Setup Connection with Entra/Exo
+    Write-Verbose 'connecting to MS-Entra'
+    $certificate = Get-MSEntraCertificate
+    $entraToken = Get-MSEntraAccessToken -Certificate $certificate
+    
+    #Add the authorization header to the request
+    $authorization = @{
+        Authorization = "Bearer $entraToken";
+        'Content-Type' = "application/json";
+        Accept = "application/json";
+    } 
+
+ 
+    $properties = @("id","displayName","userPrincipalName","givenName","surname","department","jobTitle","accountEnabled","companyName","businessPhones","mobilePhone")
+ 
+    $baseSearchUri = "https://graph.microsoft.com/"
+    $searchUri = $baseSearchUri + "v1.0/users/$id" + '?$select=' + ($properties -join ",")
+    $entraIDUser = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $authorization -Verbose:$false
+
+    foreach($tmp in $entraIDUser.psObject.properties)
+    {
+        if($tmp.Name -in $properties){
+            $returnObject = @{
+                name=$tmp.Name;
+                value=$tmp.value
+            }
+            Write-Output $returnObject
+        }
+    }
+   
+    Write-Information "Finished retrieving Entra ID user [$id] basic attributes"
+} catch {
+    $errorDetailsMessage = ($_.ErrorDetails.Message | ConvertFrom-Json).error.message
+    Write-Error ("Error searching for Entra ID user [$id]. Error: $_" + $errorDetailsMessage)
+}
+'@ 
+$tmpModel = @'
+[{"key":"name","type":0},{"key":"value","type":0}]
+'@ 
+$tmpInput = @'
+[{"description":"","translateDescription":false,"inputFieldType":1,"key":"selectedUser","type":0,"options":1}]
+'@ 
+$dataSourceGuid_1 = [PSCustomObject]@{} 
+$dataSourceGuid_1_Name = @'
+Entra-ID-remove-intune-device | generate-table-attributes-basic
+'@ 
+Invoke-HelloIDDatasource -DatasourceName $dataSourceGuid_1_Name -DatasourceType "4" -DatasourceInput $tmpInput -DatasourcePsScript $tmpPsScript -DatasourceModel $tmpModel -DataSourceRunInCloud "True" -returnObject ([Ref]$dataSourceGuid_1) 
+<# End: DataSource "Entra-ID-remove-intune-device | generate-table-attributes-basic" #>
+
+<# Begin: DataSource "Entra-ID-remove-intune-device | get-devices" #>
+$tmpPsScript = @'
+# Set TLS to accept TLS, TLS 1.1 and TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
+
+function Get-MSEntraAccessToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Certificate
+    )
+    try {
+        # Get the DER encoded bytes of the certificate
+        $derBytes = $Certificate.RawData
+
+        # Compute the SHA-256 hash of the DER encoded bytes
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $hashBytes = $sha256.ComputeHash($derBytes)
+        $base64Thumbprint = [System.Convert]::ToBase64String($hashBytes).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Create a JWT (JSON Web Token) header
+        $header = @{
+            'alg'      = 'RS256'
+            'typ'      = 'JWT'
+            'x5t#S256' = $base64Thumbprint
+        } | ConvertTo-Json
+        $base64Header = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header))
+
+        # Calculate the Unix timestamp (seconds since 1970-01-01T00:00:00Z) for 'exp', 'nbf' and 'iat'
+        $currentUnixTimestamp = [math]::Round(((Get-Date).ToUniversalTime() - ([datetime]'1970-01-01T00:00:00Z').ToUniversalTime()).TotalSeconds)
+
+        # Create a JWT payload
+        $payload = [Ordered]@{
+            'iss' = "$entraidappid"
+            'sub' = "$entraidappid"
+            'aud' = "https://login.microsoftonline.com/$EntraIdTenantId/oauth2/token"
+            'exp' = ($currentUnixTimestamp + 3600) # Expires in 1 hour
+            'nbf' = ($currentUnixTimestamp - 300) # Not before 5 minutes ago
+            'iat' = $currentUnixTimestamp
+            'jti' = [Guid]::NewGuid().ToString()
+        } | ConvertTo-Json
+        $base64Payload = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Extract the private key from the certificate
+        $rsaPrivate = $Certificate.PrivateKey
+        $rsa = [System.Security.Cryptography.RSACryptoServiceProvider]::new()
+        $rsa.ImportParameters($rsaPrivate.ExportParameters($true))
+
+        # Sign the JWT
+        $signatureInput = "$base64Header.$base64Payload"
+        $signature = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($signatureInput), 'SHA256')
+        $base64Signature = [System.Convert]::ToBase64String($signature).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Create the JWT token
+        $jwtToken = "$($base64Header).$($base64Payload).$($base64Signature)"
+
+        $createEntraAccessTokenBody = @{
+            grant_type            = 'client_credentials'
+            client_id             = $entraidappid
+            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            client_assertion      = $jwtToken
+            resource              = 'https://graph.microsoft.com'
+        }
+
+        $createEntraAccessTokenSplatParams = @{
+            Uri         = "https://login.microsoftonline.com/$EntraIdTenantId/oauth2/token"
+            Body        = $createEntraAccessTokenBody
+            Method      = 'POST'
+            ContentType = 'application/x-www-form-urlencoded'
+            Verbose     = $false
+            ErrorAction = 'Stop'
+        }
+
+        $createEntraAccessTokenResponse = Invoke-RestMethod @createEntraAccessTokenSplatParams
+        Write-Output $createEntraAccessTokenResponse.access_token
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
+
+function Get-MSEntraCertificate {
+    [CmdletBinding()]
+    param()
+    try {
+        $rawCertificate = [system.convert]::FromBase64String($EntraIdCertificateBase64String)
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate, $EntraIdCertificatePassword, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        Write-Output $certificate
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
+
+try {
+    $userPrincipalName = $datasource.selectedUser.UserPrincipalName
+
+    # Setup Connection with Entra/Exo
+    Write-Information 'connecting to MS-Entra'
+    $certificate = Get-MSEntraCertificate
+    $entraToken = Get-MSEntraAccessToken -Certificate $certificate
+    
+    #Add the authorization header to the request
+    $authorization = @{
+        Authorization  = "Bearer $entraToken";
+        'Content-Type' = "application/json";
+        Accept         = "application/json";
+    } 
+
+    Write-Information "Searching for Intune managed devices of user [$userPrincipalName]"
+
+    $baseSearchUri = "https://graph.microsoft.com/"
+    $searchUri = $baseSearchUri + "v1.0/users/$userPrincipalName/managedDevices"
+    $managedDevicesResponse = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $authorization -Verbose:$false
+    $managedDevices = $managedDevicesResponse.value
+    while (![string]::IsNullOrEmpty($managedDevicesResponse.'@odata.nextLink')) {
+        $managedDevicesResponse = Invoke-RestMethod -Uri $managedDevicesResponse.'@odata.nextLink' -Method Get -Headers $authorization -Verbose:$false
+        $managedDevices += $managedDevicesResponse.value
+    }
+
+    $devices = $managedDevices
+    $resultCount = @($devices).Count
+    Write-Information "Managed devices: $resultCount"
+
+    if ($resultCount -gt 0) {
+        foreach ($device in $devices) {
+            $returnObject = @{ name = "$($device.deviceName)"; id = "$($device.id)" }
+            Write-Output $returnObject
+        }
+    }
+}
+catch {
+    Write-Error "Error getting Intune devices for EntraID user [$userPrincipalName]. Error: $($_.Exception.Message)"
+}
+'@ 
+$tmpModel = @'
+[{"key":"name","type":0},{"key":"id","type":0}]
+'@ 
+$tmpInput = @'
+[{"description":null,"translateDescription":false,"inputFieldType":1,"key":"selectedUser","type":0,"options":1}]
+'@ 
+$dataSourceGuid_2 = [PSCustomObject]@{} 
+$dataSourceGuid_2_Name = @'
+Entra-ID-remove-intune-device | get-devices
+'@ 
+Invoke-HelloIDDatasource -DatasourceName $dataSourceGuid_2_Name -DatasourceType "4" -DatasourceInput $tmpInput -DatasourcePsScript $tmpPsScript -DatasourceModel $tmpModel -DataSourceRunInCloud "True" -returnObject ([Ref]$dataSourceGuid_2) 
+<# End: DataSource "Entra-ID-remove-intune-device | get-devices" #>
+
+<# Begin: DataSource "Entra-ID-remove-intune-device | generate-table-wildcard" #>
+$tmpPsScript = @'
+# Set TLS to accept TLS, TLS 1.1 and TLS 1.2
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
+
+function Get-MSEntraAccessToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Certificate
+    )
+    try {
+        # Get the DER encoded bytes of the certificate
+        $derBytes = $Certificate.RawData
+
+        # Compute the SHA-256 hash of the DER encoded bytes
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        $hashBytes = $sha256.ComputeHash($derBytes)
+        $base64Thumbprint = [System.Convert]::ToBase64String($hashBytes).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Create a JWT (JSON Web Token) header
+        $header = @{
+            'alg'      = 'RS256'
+            'typ'      = 'JWT'
+            'x5t#S256' = $base64Thumbprint
+        } | ConvertTo-Json
+        $base64Header = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header))
+
+        # Calculate the Unix timestamp (seconds since 1970-01-01T00:00:00Z) for 'exp', 'nbf' and 'iat'
+        $currentUnixTimestamp = [math]::Round(((Get-Date).ToUniversalTime() - ([datetime]'1970-01-01T00:00:00Z').ToUniversalTime()).TotalSeconds)
+
+        # Create a JWT payload
+        $payload = [Ordered]@{
+            'iss' = "$entraidappid"
+            'sub' = "$entraidappid"
+            'aud' = "https://login.microsoftonline.com/$EntraIdTenantId/oauth2/token"
+            'exp' = ($currentUnixTimestamp + 3600) # Expires in 1 hour
+            'nbf' = ($currentUnixTimestamp - 300) # Not before 5 minutes ago
+            'iat' = $currentUnixTimestamp
+            'jti' = [Guid]::NewGuid().ToString()
+        } | ConvertTo-Json
+        $base64Payload = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Extract the private key from the certificate
+        $rsaPrivate = $Certificate.PrivateKey
+        $rsa = [System.Security.Cryptography.RSACryptoServiceProvider]::new()
+        $rsa.ImportParameters($rsaPrivate.ExportParameters($true))
+
+        # Sign the JWT
+        $signatureInput = "$base64Header.$base64Payload"
+        $signature = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($signatureInput), 'SHA256')
+        $base64Signature = [System.Convert]::ToBase64String($signature).Replace('+', '-').Replace('/', '_').Replace('=', '')
+
+        # Create the JWT token
+        $jwtToken = "$($base64Header).$($base64Payload).$($base64Signature)"
+
+        $createEntraAccessTokenBody = @{
+            grant_type            = 'client_credentials'
+            client_id             = $entraidappid
+            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            client_assertion      = $jwtToken
+            resource              = 'https://graph.microsoft.com'
+        }
+
+        $createEntraAccessTokenSplatParams = @{
+            Uri         = "https://login.microsoftonline.com/$EntraIdTenantId/oauth2/token"
+            Body        = $createEntraAccessTokenBody
+            Method      = 'POST'
+            ContentType = 'application/x-www-form-urlencoded'
+            Verbose     = $false
+            ErrorAction = 'Stop'
+        }
+
+        $createEntraAccessTokenResponse = Invoke-RestMethod @createEntraAccessTokenSplatParams
+        Write-Output $createEntraAccessTokenResponse.access_token
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
+
+function Get-MSEntraCertificate {
+    [CmdletBinding()]
+    param()
+    try {
+        $rawCertificate = [system.convert]::FromBase64String($EntraIdCertificateBase64String)
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate, $EntraIdCertificatePassword, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        Write-Output $certificate
+    }
+    catch {
+        $PSCmdlet.ThrowTerminatingError($_)
+    }
+}
+
+try {
+    $searchValue = $datasource.searchUser
+    $searchQuery = "*$searchValue*"
+    
+    # Setup Connection with Entra/Exo
+    Write-Verbose 'connecting to MS-Entra'
+    $certificate = Get-MSEntraCertificate
+    $entraToken = Get-MSEntraAccessToken -Certificate $certificate
+    
+    #Add the authorization header to the request
+    $authorization = @{
+        Authorization = "Bearer $entraToken";
+        'Content-Type' = "application/json";
+        Accept = "application/json";
+    } 
+
+    $baseSearchUri = "https://graph.microsoft.com/"
+    $searchUri = $baseSearchUri + "v1.0/users" + '?$select=Id,UserPrincipalName,displayName,department,jobTitle,companyName,accountEnabled' + '&$top=999'
+
+    $entraidUsersResponse = Invoke-RestMethod -Uri $searchUri -Method Get -Headers $authorization -Verbose:$false
+    $entraidUsers = $entraidUsersResponse.value
+    while (![string]::IsNullOrEmpty($entraidUsersResponse.'@odata.nextLink')) {
+        $entraidUsersResponse = Invoke-RestMethod -Uri $entraidUsersResponse.'@odata.nextLink' -Method Get -Headers $authorization -Verbose:$false
+        $entraidUsers += $entraidUsersResponse.value
+    }  
+
+    $users = foreach($entraidUser in $entraidUsers){
+        if($entraidUser.displayName -like $searchQuery -or $entraidUser.userPrincipalName -like $searchQuery){
+            $entraidUser
+        }
+    }
+    $users = $users | Sort-Object -Property DisplayName
+    $resultCount = @($users).Count
+    Write-Information "Result count: $resultCount"
+        
+    if($resultCount -gt 0){
+        foreach($user in $users){
+            $returnObject = @{
+                Id=$user.Id;
+                UserPrincipalName=$user.UserPrincipalName;
+                DisplayName=$user.DisplayName;
+                Department=$user.Department;
+                Title=$user.JobTitle;
+                Company=$user.CompanyName
+                Enabled=$user.accountEnabled
+            }
+            Write-Output $returnObject
+        }
+    }
+} catch {
+    $errorDetailsMessage = ($_.ErrorDetails.Message | ConvertFrom-Json).error.message
+    Write-Error ("Error searching for Entra ID users. Error: $_" + $errorDetailsMessage)
+}
+  
+'@ 
+$tmpModel = @'
+[{"key":"DisplayName","type":0},{"key":"Department","type":0},{"key":"Title","type":0},{"key":"Id","type":0},{"key":"Enabled","type":0},{"key":"UserPrincipalName","type":0},{"key":"Company","type":0}]
+'@ 
+$tmpInput = @'
+[{"description":"","translateDescription":false,"inputFieldType":1,"key":"searchUser","type":0,"options":1}]
+'@ 
+$dataSourceGuid_0 = [PSCustomObject]@{} 
+$dataSourceGuid_0_Name = @'
+Entra-ID-remove-intune-device | generate-table-wildcard
+'@ 
+Invoke-HelloIDDatasource -DatasourceName $dataSourceGuid_0_Name -DatasourceType "4" -DatasourceInput $tmpInput -DatasourcePsScript $tmpPsScript -DatasourceModel $tmpModel -DataSourceRunInCloud "True" -returnObject ([Ref]$dataSourceGuid_0) 
+<# End: DataSource "Entra-ID-remove-intune-device | generate-table-wildcard" #>
+<# End: HelloID Data sources #>
+
+<# Begin: Dynamic Form "Entra ID Account - Remove inTune device" #>
+$tmpSchema = @"
+[{"label":"Select user account","fields":[{"key":"searchfield","templateOptions":{"label":"Search","placeholder":"Username or email address"},"type":"input","summaryVisibility":"Hide element","requiresTemplateOptions":true,"requiresKey":true,"requiresDataSource":false},{"key":"gridUsers","templateOptions":{"label":"Select user","required":true,"grid":{"columns":[{"headerName":"Display Name","field":"DisplayName"},{"headerName":"User Principal Name","field":"UserPrincipalName"},{"headerName":"Enabled","field":"Enabled"},{"headerName":"Department","field":"Department"},{"headerName":"Title","field":"Title"},{"headerName":"Id","field":"Id"}],"height":300,"rowSelection":"single"},"dataSourceConfig":{"dataSourceGuid":"$dataSourceGuid_0","input":{"propertyInputs":[{"propertyName":"searchUser","otherFieldValue":{"otherFieldKey":"searchfield"}}]}},"useFilter":false,"allowCsvDownload":true},"type":"grid","summaryVisibility":"Show","requiresTemplateOptions":true,"requiresKey":true,"requiresDataSource":true}]},{"label":"Intune","fields":[{"key":"gridDetails","templateOptions":{"label":"Basic attributes","required":false,"grid":{"columns":[{"headerName":"Name","field":"name"},{"headerName":"Value","field":"value"}],"height":350,"rowSelection":"single"},"dataSourceConfig":{"dataSourceGuid":"$dataSourceGuid_1","input":{"propertyInputs":[{"propertyName":"selectedUser","otherFieldValue":{"otherFieldKey":"gridUsers"}}]}},"useFilter":false,"allowCsvDownload":true},"type":"grid","summaryVisibility":"Hide element","requiresTemplateOptions":true,"requiresKey":true,"requiresDataSource":true},{"templateOptions":{"title":"Select the devices that have to be removed","titleField":"","bannerType":"Info","useBody":false},"type":"textbanner","summaryVisibility":"Hide element","body":"Text Banner Content","requiresTemplateOptions":false,"requiresKey":false,"requiresDataSource":false},{"key":"devices","templateOptions":{"label":"Devices","required":false,"filterable":true,"useDataSource":true,"dualList":{"options":[{"guid":"75ea2890-88f8-4851-b202-626123054e14","name":"Apple"},{"guid":"0607270d-83e2-4574-9894-0b70011b663f","name":"Pear"},{"guid":"1ef6fe01-3095-4614-a6db-7c8cd416ae3b","name":"Orange"}],"optionKeyProperty":"id","optionDisplayProperty":"name"},"dataSourceConfig":{"dataSourceGuid":"$dataSourceGuid_2","input":{"propertyInputs":[{"propertyName":"selectedUser","otherFieldValue":{"otherFieldKey":"gridUsers"}}]}}},"type":"duallist","summaryVisibility":"Show","sourceDataSourceIdentifierSuffix":"source-datasource","destinationDataSourceIdentifierSuffix":"destination-datasource","requiresTemplateOptions":true,"requiresKey":true,"requiresDataSource":false}]}]
+"@ 
+
+$dynamicFormGuid = [PSCustomObject]@{} 
+$dynamicFormName = @'
+Entra ID Account - Remove inTune device
+'@ 
+Invoke-HelloIDDynamicForm -FormName $dynamicFormName -FormSchema $tmpSchema  -returnObject ([Ref]$dynamicFormGuid) 
+<# END: Dynamic Form #>
+
+<# Begin: Delegated Form Access Groups and Categories #>
+$delegatedFormAccessGroupGuids = @()
+if(-not[String]::IsNullOrEmpty($delegatedFormAccessGroupNames)){
+    foreach($group in $delegatedFormAccessGroupNames) {
+        try {
+            $uri = ($script:PortalBaseUrl +"api/v1/groups/$group")
+            $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false
+            $delegatedFormAccessGroupGuid = $response.groupGuid
+            $delegatedFormAccessGroupGuids += $delegatedFormAccessGroupGuid
+        
+            Write-Information "HelloID (access)group '$group' successfully found$(if ($script:debugLogging -eq $true) { ": " + $delegatedFormAccessGroupGuid })"
+        } catch {
+            Write-Error "HelloID (access)group '$group', message: $_"
+        }
+    }
+    if($null -ne $delegatedFormAccessGroupGuids){
+        $delegatedFormAccessGroupGuids = ($delegatedFormAccessGroupGuids | Select-Object -Unique | ConvertTo-Json -Depth 100 -Compress)
+    }
+}
+
+$delegatedFormCategoryGuids = @()
+foreach($category in $delegatedFormCategories) {
+    try {
+        $uri = ($script:PortalBaseUrl +"api/v1/delegatedformcategories/$category")
+        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false
+        $response = $response | Where-Object {$_.name.en -eq $category}
+    
+        $tmpGuid = $response.delegatedFormCategoryGuid
+        $delegatedFormCategoryGuids += $tmpGuid
+    
+        Write-Information "HelloID Delegated Form category '$category' successfully found$(if ($script:debugLogging -eq $true) { ": " + $tmpGuid })"
+    } catch {
+        Write-Warning "HelloID Delegated Form category '$category' not found"
+        $body = @{
+            name = @{"en" = $category};
+        }
+        $body = ConvertTo-Json -InputObject $body -Depth 100
+
+        $uri = ($script:PortalBaseUrl +"api/v1/delegatedformcategories")
+        $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $script:headers -ContentType "application/json" -Verbose:$false -Body $body
+        $tmpGuid = $response.delegatedFormCategoryGuid
+        $delegatedFormCategoryGuids += $tmpGuid
+
+        Write-Information "HelloID Delegated Form category '$category' successfully created$(if ($script:debugLogging -eq $true) { ": " + $tmpGuid })"
+    }
+}
+$delegatedFormCategoryGuids = (ConvertTo-Json -InputObject $delegatedFormCategoryGuids -Depth 100 -Compress)
+<# End: Delegated Form Access Groups and Categories #>
+
+<# Begin: Delegated Form #>
+$delegatedFormRef = [PSCustomObject]@{guid = $null; created = $null} 
+$delegatedFormName = @'
+Entra ID Account - Remove inTune device
+'@
+$tmpTask = @'
+{"name":"Entra ID Account - Remove inTune device","script":"# Set TLS to accept TLS, TLS 1.1 and TLS 1.2\r\n[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12\r\n\r\n$VerbosePreference = \"SilentlyContinue\"\r\n$InformationPreference = \"Continue\"\r\n$WarningPreference = \"Continue\"\r\n\r\n# variables configured in form\r\n$intunedevicestoremove = $form.devices.LefttoRight\r\n$userPrincipalName = $form.gridUsers.UserPrincipalName\r\n$id = $form.gridUsers.Id\r\n$DisplayName = $form.gridUsers.DisplayName\r\n\r\nfunction Get-MSEntraAccessToken {\r\n    [CmdletBinding()]\r\n    param(\r\n        [Parameter(Mandatory)]\r\n        $Certificate\r\n    )\r\n    try {\r\n        # Get the DER encoded bytes of the certificate\r\n        $derBytes = $Certificate.RawData\r\n\r\n        # Compute the SHA-256 hash of the DER encoded bytes\r\n        $sha256 = [System.Security.Cryptography.SHA256]::Create()\r\n        $hashBytes = $sha256.ComputeHash($derBytes)\r\n        $base64Thumbprint = [System.Convert]::ToBase64String($hashBytes).Replace('+', '-').Replace('/', '_').Replace('=', '')\r\n\r\n        # Create a JWT (JSON Web Token) header\r\n        $header = @{\r\n            'alg'      = 'RS256'\r\n            'typ'      = 'JWT'\r\n            'x5t#S256' = $base64Thumbprint\r\n        } | ConvertTo-Json\r\n        $base64Header = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($header))\r\n\r\n        # Calculate the Unix timestamp (seconds since 1970-01-01T00:00:00Z) for 'exp', 'nbf' and 'iat'\r\n        $currentUnixTimestamp = [math]::Round(((Get-Date).ToUniversalTime() - ([datetime]'1970-01-01T00:00:00Z').ToUniversalTime()).TotalSeconds)\r\n\r\n        # Create a JWT payload\r\n        $payload = [Ordered]@{\r\n            'iss' = \"$entraidappid\"\r\n            'sub' = \"$entraidappid\"\r\n            'aud' = \"https://login.microsoftonline.com/$EntraIdTenantId/oauth2/token\"\r\n            'exp' = ($currentUnixTimestamp + 3600) # Expires in 1 hour\r\n            'nbf' = ($currentUnixTimestamp - 300) # Not before 5 minutes ago\r\n            'iat' = $currentUnixTimestamp\r\n            'jti' = [Guid]::NewGuid().ToString()\r\n        } | ConvertTo-Json\r\n        $base64Payload = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload)).Replace('+', '-').Replace('/', '_').Replace('=', '')\r\n\r\n        # Extract the private key from the certificate\r\n        $rsaPrivate = $Certificate.PrivateKey\r\n        $rsa = [System.Security.Cryptography.RSACryptoServiceProvider]::new()\r\n        $rsa.ImportParameters($rsaPrivate.ExportParameters($true))\r\n\r\n        # Sign the JWT\r\n        $signatureInput = \"$base64Header.$base64Payload\"\r\n        $signature = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($signatureInput), 'SHA256')\r\n        $base64Signature = [System.Convert]::ToBase64String($signature).Replace('+', '-').Replace('/', '_').Replace('=', '')\r\n\r\n        # Create the JWT token\r\n        $jwtToken = \"$($base64Header).$($base64Payload).$($base64Signature)\"\r\n\r\n        $createEntraAccessTokenBody = @{\r\n            grant_type            = 'client_credentials'\r\n            client_id             = $entraidappid\r\n            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'\r\n            client_assertion      = $jwtToken\r\n            resource              = 'https://graph.microsoft.com'\r\n        }\r\n\r\n        $createEntraAccessTokenSplatParams = @{\r\n            Uri         = \"https://login.microsoftonline.com/$EntraIdTenantId/oauth2/token\"\r\n            Body        = $createEntraAccessTokenBody\r\n            Method      = 'POST'\r\n            ContentType = 'application/x-www-form-urlencoded'\r\n            Verbose     = $false\r\n            ErrorAction = 'Stop'\r\n        }\r\n\r\n        $createEntraAccessTokenResponse = Invoke-RestMethod @createEntraAccessTokenSplatParams\r\n        Write-Output $createEntraAccessTokenResponse.access_token\r\n    }\r\n    catch {\r\n        $PSCmdlet.ThrowTerminatingError($_)\r\n    }\r\n}\r\n\r\nfunction Get-MSEntraCertificate {\r\n    [CmdletBinding()]\r\n    param()\r\n    try {\r\n        $rawCertificate = [system.convert]::FromBase64String($EntraIdCertificateBase64String)\r\n        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate, $EntraIdCertificatePassword, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)\r\n        Write-Output $certificate\r\n    }\r\n    catch {\r\n        $PSCmdlet.ThrowTerminatingError($_)\r\n    }\r\n}\r\n\r\ntry {\r\n    # Setup Connection with Entra/Exo\r\n    Write-Verbose 'connecting to MS-Entra'\r\n    $certificate = Get-MSEntraCertificate\r\n    $entraToken = Get-MSEntraAccessToken -Certificate $certificate\r\n    \r\n    #Add the authorization header to the request\r\n    $authorization = @{\r\n        Authorization = \"Bearer $entraToken\";\r\n        'Content-Type' = \"application/json\";\r\n        Accept = \"application/json\";\r\n    } \r\n\r\n    #to-do: remove devices from user account\r\n    Write-Information \"Removing devices from Entra ID user [$userPrincipalName ($id)]..\"\r\n\r\n    $graphBaseUri = \"https://graph.microsoft.com/v1.0\"\r\n\r\n    foreach ($device in $intunedevicestoremove) {\r\n        $deviceId = $device.id\r\n\r\n        # 'registeredDevices', 'ownedDevices'\r\n        foreach ($nav in @('ownedDevices')) {\r\n            $deleteUri = \"$graphBaseUri/users/$id/$nav/$deviceId/`$ref\"\r\n            try {\r\n                Invoke-RestMethod -Uri $deleteUri -Method DELETE -Headers $authorization -Verbose:$false -ErrorAction Stop\r\n                Write-Verbose \"Removed $nav link for device [$deviceId]\"\r\n                break\r\n            }\r\n            catch {\r\n                Write-Verbose \"Failed removing $nav link for device [$deviceId]: $($_.Exception.Message)\"\r\n            }\r\n        }\r\n    }\r\n\r\n    Write-Information \"Removed devices from Entra ID user [$userPrincipalName ($id)] successfully\"\r\n\r\n    $Log = @{\r\n        Action            = \"UpdateAccount\" # optional. ENUM (undefined = default) \r\n        System            = \"EntraID\" # optional (free format text) \r\n        Message           = \"Devices removed from Entra ID user [$userPrincipalName ($id)] successfully\" # required (free format text) \r\n        IsError           = $false # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) \r\n        TargetDisplayName = $DisplayName # optional (free format text) \r\n        TargetIdentifier  = $([string]$id) # optional (free format text) \r\n    }\r\n    #send result back  \r\n    Write-Information -Tags \"Audit\" -MessageData $log\r\n\r\n}\r\ncatch {\r\n    Write-Error \"Error removing devices from Entra ID user [$userPrincipalName ($id)]. Error: $_\"\r\n\r\n    $Log = @{\r\n        Action            = \"UpdateAccount\" # optional. ENUM (undefined = default) \r\n        System            = \"EntraID\" # optional (free format text) \r\n        Message           = \"Error removing devices from Entra ID user [$userPrincipalName ($id)]\" # required (free format text) \r\n        IsError           = $true # optional. Elastic reporting purposes only. (default = $false. $true = Executed action returned an error) \r\n        TargetDisplayName = $DisplayName # optional (free format text) \r\n        TargetIdentifier  = $([string]$id) # optional (free format text) \r\n    }\r\n    #send result back  \r\n    Write-Information -Tags \"Audit\" -MessageData $log\r\n    \r\n}","runInCloud":true}
+'@ 
+
+Invoke-HelloIDDelegatedForm -DelegatedFormName $delegatedFormName -DynamicFormGuid $dynamicFormGuid -AccessGroups $delegatedFormAccessGroupGuids -Categories $delegatedFormCategoryGuids -UseFaIcon "True" -FaIcon "fa fa-tablet" -task $tmpTask -returnObject ([Ref]$delegatedFormRef) 
+<# End: Delegated Form #>
+
